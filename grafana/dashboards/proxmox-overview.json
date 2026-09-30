@@ -1200,7 +1200,7 @@
       "icon": "dashboard"
     },
     {
-      "title": "R710 Hardware",
+      "title": "Host Hardware",
       "type": "link",
       "url": "/d/pve-hardware",
       "icon": "dashboard"

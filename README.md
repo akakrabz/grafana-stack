@@ -1,116 +1,170 @@
 # grafana-stack — Proxmox VE monitoring (InfluxDB 2 + Grafana)
 
-Git-deployable monitoring stack for a Proxmox VE host (Dell R710 + GPU), built to be
-cloned and deployed straight from **Portainer Business Edition** onto a Docker LXC
-running the Portainer Agent.
+A monitoring stack for Proxmox VE that deploys straight from this git repo via
+**Portainer** (Business Edition git stacks). Runs in any Docker host — the intended
+setup is an LXC container on the Proxmox node itself running the Portainer Agent.
+
+Nothing here is hardware-specific. Base metrics come from Proxmox itself; hardware
+extras (BMC/IPMI, lm-sensors, SMART, NVIDIA/AMD GPU) are optional modules that the
+host installer enables only when they actually work on your machine.
 
 ```
-Proxmox host (R710)                          LXC "monitoring" (Docker + Portainer Agent)
-┌──────────────────────────────┐             ┌─────────────────────────────────────┐
-│ PVE metric server ───────────┼──push──────▶│ InfluxDB 2.x  :8086                 │
-│   nodes / VMs / CTs / storage│             │     ▲                               │
-│                              │             │     │ Flux                          │
-│ Telegraf (host) ─────────────┼──push──────▶│ Grafana       :3000  (provisioned)  │
-│   IPMI, SMART, sensors, GPU  │             │ Telegraf (docker metrics of the LXC)│
-└──────────────────────────────┘             └─────────────────────────────────────┘
+Hypervisor host (Proxmox VE)                      Docker host (LXC + Portainer Agent)
+┌──────────────────────────────────┐              ┌─────────────────────────────────────┐
+│ PVE metric server (built-in) ────┼──push───────▶│ InfluxDB 2.x  :8086                 │
+│   nodes / VMs / CTs / storage    │              │      ▲  Flux                        │
+│                                  │              │ Grafana       :3000 (provisioned)   │
+│ Telegraf (optional) ─────────────┼──push───────▶│ Telegraf (stack/docker metrics)     │
+│   base OS + [ipmi][sensors]      │              └─────────────────────────────────────┘
+│             [smart][nvidia][amd] │
+└──────────────────────────────────┘
 ```
 
-## What gets monitored
+## What you get
 
-| Source | Data | Dashboard |
-|---|---|---|
-| **PVE built-in metric server** (no agent needed) | Node CPU / RAM / load / IO-wait / NICs, every VM & CT (CPU, RAM, net, disk I/O, uptime), storage pool usage | `Proxmox Overview` |
-| **Telegraf on the PVE host** – `ipmi_sensor` (iDRAC6) | Inlet/ambient temps, fan RPM, PSU power draw, voltages, sensor status | `R710 Hardware` |
-| Telegraf – `smart` | Disk temps, SMART health, error counters | `R710 Hardware` |
-| Telegraf – `sensors` / `temp` / `cpu` / `diskio` | Core temps, host CPU breakdown, disk throughput & IOPS | `R710 Hardware` |
-| Telegraf – `nvidia_smi` (or `amd_rocm_smi`) | GPU util, VRAM, temp, power, clocks, fan | `GPU` |
-| Telegraf in the stack – `docker` | Container CPU/mem/net of the stack itself | (use Explore) |
+| Source | Needs | Data | Dashboard |
+|---|---|---|---|
+| PVE built-in metric server | nothing on the host | node CPU/RAM/load/IO-wait/NICs; every VM & CT (CPU, RAM, net, disk I/O, uptime); storage pools | **Proxmox Overview** |
+| Telegraf base | Telegraf on host | host CPU breakdown, disk throughput/IOPS, kernel/thermal zones | **Host Hardware** |
+| module `ipmi` | working `ipmitool` + `/dev/ipmi0` | BMC temps, fans, PSU watts, voltages, sensor status | Host Hardware |
+| module `sensors` | lm-sensors finds chips | core/board temps | Host Hardware |
+| module `smart` | `smartctl --scan` sees disks | disk temps, health, error counters | Host Hardware |
+| module `nvidia` | `nvidia-smi` works (any driver age) | util, VRAM, temp, clocks, power/fan where reported | **GPU** |
+| module `amd` | `rocm-smi` | same, AMD | GPU (needs panel tweaks) |
+| Telegraf in stack | – | Docker container metrics of the stack itself | (Explore) |
+
+Panels whose module isn't enabled simply stay empty; nothing breaks.
 
 ## Repo layout
 
 ```
-docker-compose.yml               stack file used by Portainer
-.env.example                     every variable the stack needs
-grafana/provisioning/            datasource + dashboard provider (auto-loaded)
-grafana/dashboards/*.json        the three dashboards
-telegraf/telegraf-stack.conf     Telegraf inside the stack (docker metrics)
-telegraf/telegraf-pve-host.conf  Telegraf on the PVE host (hardware/GPU)
-telegraf/install-pve-host.sh     installs + configures host Telegraf
-proxmox/create-lxc.sh            creates the Docker LXC + Portainer Agent
-proxmox/configure-metric-server.sh  points PVE's metric server at InfluxDB
+docker-compose.yml                 the stack Portainer deploys
+.env.example                       every variable the stack needs
+grafana/provisioning/              datasource + dashboard provider (auto-loaded)
+grafana/dashboards/*.json          Proxmox Overview, Host Hardware, GPU
+lxc/setup-docker-host.sh           run inside the container: Docker + Portainer Agent
+proxmox/create-lxc.sh              OPTIONAL: creates the container from the PVE shell
+proxmox/configure-metric-server.sh registers InfluxDB as PVE's metric server
+telegraf/host/install.sh           host Telegraf installer with hardware probing
+telegraf/host/telegraf.conf        base host config (always on)
+telegraf/host/optional/*.conf      ipmi / sensors / smart / nvidia / amd modules
+telegraf/stack/telegraf.conf       Telegraf inside the stack (docker metrics)
 ```
 
-## Deploy (first time)
+---
 
-### 1. Create the LXC on the Proxmox host
+## Setup
+
+### Step 1 — Create the container
+
+Any Debian 12/13 (or Ubuntu) LXC works. Docker inside an LXC needs **nesting**; these
+are the settings that matter:
+
+| Setting | Value | Why |
+|---|---|---|
+| Template | `debian-13-standard` (12 also fine) | `setup-docker-host.sh` detects the codename |
+| Unprivileged | **yes** | works fine with nesting; safer |
+| Features | **nesting = 1**, **keyctl = 1** | required for dockerd / containerd |
+| Resources | 2 cores, 4 GB RAM, 20–30 GB disk | InfluxDB + Grafana are light; disk grows with retention |
+| Network | static IP or DHCP reservation | Portainer, PVE and Telegraf all point at this IP |
+| Start at boot | yes | |
+
+**PVE web UI:** *Create CT* → tick *Unprivileged* → pick template → after creation go to
+*Options → Features* and enable *Nesting* and *keyctl* → start it.
+
+**PVE shell equivalent** (or just run `proxmox/create-lxc.sh`, which does steps 1–2 for you):
 ```bash
-git clone <this repo> && cd grafana-stack/proxmox
-CTID=200 STORAGE=local-lvm IP=192.168.1.50/24 GW=192.168.1.1 ./create-lxc.sh
+pct create 200 local:vztmpl/debian-13-standard_13.0-1_amd64.tar.zst \
+  --hostname monitoring --unprivileged 1 --features nesting=1,keyctl=1 \
+  --cores 2 --memory 4096 --rootfs local-lvm:24 \
+  --net0 name=eth0,bridge=vmbr0,ip=dhcp --onboot 1 --password
+pct start 200
 ```
-Unprivileged Debian 12 CT with `nesting=1,keyctl=1`, Docker CE and `portainer/agent` on
-`:9001`. The script prints the CT IP, root password and the **docker GID** (needed below).
 
-### 2. Add the environment in Portainer BE
-*Environments → Add environment → Docker Standalone → Agent* → `CT_IP:9001`.
+### Step 2 — Inside the container: clone this repo and run the helper
 
-### 3. Deploy the stack from git
-*Stacks → Add stack → Repository*
-- Repository URL: this repo, reference `refs/heads/main`, compose path `docker-compose.yml`
-- **Enable relative path volumes** (Portainer BE feature) — required so the
-  `./grafana/...` and `./telegraf/...` bind mounts resolve to the cloned repo on the agent.
-  Local filesystem path: e.g. `/opt/stacks`
-- GitOps updates: enable polling (e.g. 5m) or a webhook so every `git push` redeploys
-- Environment variables: paste `.env.example` and set real values. Generate the token with
-  `openssl rand -hex 32`. Set `DOCKER_GID` to the value printed by step 1.
-
-Deploy. Grafana comes up at `http://CT_IP:3000` with the InfluxDB datasource and all
-three dashboards already provisioned (folder **Proxmox**). Home dashboard = Proxmox Overview.
-
-### 4. Point Proxmox at InfluxDB (on the PVE host)
 ```bash
-INFLUX_HOST=192.168.1.50 INFLUX_TOKEN=<INFLUXDB_ADMIN_TOKEN> ./proxmox/configure-metric-server.sh
+apt-get update && apt-get install -y git
+git clone https://github.com/akakrabz/grafana-stack.git /opt/grafana-stack
+/opt/grafana-stack/lxc/setup-docker-host.sh
 ```
-Equivalent UI path: *Datacenter → Metric Server → Add → InfluxDB* (protocol HTTP, port 8086,
-organization/bucket/token from the stack env). Data appears within ~30 s.
+The script installs Docker CE + compose plugin (Debian 12/13, Ubuntu), starts the
+**Portainer Agent on :9001**, creates `/opt/stacks`, and prints the three values you need
+next: the container IP, the **docker GID**, and the stacks path. It is idempotent.
 
-### 5. Hardware + GPU metrics (on the PVE host)
+> Pin the agent to your Portainer server's version with `PORTAINER_AGENT_VERSION=2.27.1`
+> if the versions must match (Portainer warns when they don't).
+
+### Step 3 — Put the repo into Portainer
+
+1. **Environments → Add environment → Docker Standalone → Agent**
+   URL = `CT_IP:9001`. Connect.
+2. **Stacks → Add stack → Repository**
+   - Repository URL: `https://github.com/akakrabz/grafana-stack` (add credentials if private)
+   - Reference: `refs/heads/main` — Compose path: `docker-compose.yml`
+   - **Enable relative path volumes** (BE feature) — *required*: the `./grafana/...` and
+     `./telegraf/...` mounts must resolve to the cloned repo on the agent host.
+     Local filesystem path: `/opt/stacks`
+   - **GitOps updates**: polling (e.g. 5 min) or a webhook → every `git push` redeploys
+   - **Environment variables**: *Advanced mode* → paste `.env.example` → set real values.
+     `INFLUXDB_ADMIN_TOKEN` = `openssl rand -hex 32`. `DOCKER_GID` = value from step 2.
+3. **Deploy the stack.** Grafana: `http://CT_IP:3000` — datasource and all dashboards are
+   already there (folder *Proxmox*). InfluxDB UI: `http://CT_IP:8086`.
+
+### Step 4 — Point Proxmox at InfluxDB (on the PVE host, once)
+
 ```bash
-INFLUX_URL=http://192.168.1.50:8086 INFLUX_TOKEN=<INFLUXDB_ADMIN_TOKEN> ./telegraf/install-pve-host.sh
+git clone https://github.com/akakrabz/grafana-stack.git /opt/grafana-stack   # if not already
+INFLUX_HOST=CT_IP INFLUX_TOKEN=<INFLUXDB_ADMIN_TOKEN> /opt/grafana-stack/proxmox/configure-metric-server.sh
 ```
-Installs Telegraf from InfluxData's repo plus `ipmitool`, `smartmontools`, `lm-sensors`,
-loads the IPMI kernel modules for the iDRAC6, and adds a sudoers rule so Telegraf can run
-`ipmitool` / `smartctl`. `journalctl -u telegraf -f` shows any plugin errors.
+UI equivalent: *Datacenter → Metric Server → Add → InfluxDB*: server = CT_IP, port 8086,
+protocol **HTTP**, organization / bucket / token from the stack env. Data shows within ~30 s.
+This gives you the whole *Proxmox Overview* dashboard with **no agent on the host**.
 
-## Notes for the R710
+### Step 5 (optional) — Hardware & GPU metrics: Telegraf on the host
 
-- **IPMI**: the iDRAC6 exposes `Ambient Temp`, `FAN1–6 RPM`, `System Level` (input watts),
-  voltages, PSU and intrusion status. The dashboard's stat panels match on those names;
-  check *IPMI sensor status* table for the exact names if a panel is empty.
-- **SMART behind a PERC H700**: disks are hidden behind the RAID controller. Run
-  `smartctl --scan` and set `devices = ["/dev/sda -d megaraid,0", ...]` in
-  `telegraf/telegraf-pve-host.conf` (`[[inputs.smart]]`).
-- **GPU**: `nvidia_smi` needs the proprietary NVIDIA driver on the host (`nvidia-smi` on
-  PATH). The install script comments the plugin out if `nvidia-smi` is missing. For an AMD
-  card, swap in the `amd_rocm_smi` block (already in the config, commented). If the GPU is
-  passed through to a VM, run Telegraf **inside that VM** with just the GPU input instead.
-- **Old CPUs (Xeon 55xx/56xx)**: `sensors-detect` finds `coretemp`; nothing else is needed.
-
-## Updating
-
-Edit, commit, push. Portainer redeploys on its next poll / webhook. Dashboards JSON is
-re-read by Grafana every 30 s (provider `updateIntervalSeconds`), so dashboard-only
-changes don't even need a redeploy. Dashboards edited in the UI can be exported
-(*Share → Export → JSON*) and committed back to `grafana/dashboards/`.
-
-## Cloning to another host
-
-Only the environment variables are host-specific. Deploy the same repo as a second
-Portainer stack with a different env, then point the other PVE node's metric server and
-Telegraf at it — or point several nodes at one InfluxDB; every dashboard has a `node` /
-`host` selector.
-
-## Local test without Portainer
 ```bash
-cp .env.example .env   # edit values
-docker compose up -d
+/opt/grafana-stack/telegraf/host/install.sh --probe        # dry run: shows what would be enabled
+INFLUX_URL=http://CT_IP:8086 INFLUX_TOKEN=<token> /opt/grafana-stack/telegraf/host/install.sh
 ```
+The installer adds Telegraf plus `ipmitool`, `smartmontools`, `lm-sensors`, then **probes**
+each module and writes only the working ones to `/etc/telegraf/telegraf.d/`:
+
+| Module | Enabled when | If it's off |
+|---|---|---|
+| `ipmi` | `/dev/ipmi0` exists **and** `ipmitool sensor` returns rows | BMC unreachable locally (dead/odd BMC NIC, no driver). Either live without it, or poll the BMC over the network: set `servers = ["user:pass@lanplus(BMC_IP)"]` in `optional/ipmi.conf` and `ENABLE=ipmi` |
+| `sensors` | `sensors` prints readings | run `sensors-detect` manually; some boards expose nothing |
+| `smart` | `smartctl --scan` lists disks | disks behind a RAID controller: set `devices = ["/dev/sda -d megaraid,0", …]` and `ENABLE=smart` |
+| `nvidia` | `nvidia-smi -q -x` succeeds | install/repair the NVIDIA driver; legacy branches (390/470) work — fields the card doesn't report (power on bus-powered cards, fan on passive ones) are just absent |
+| `amd` | `/opt/rocm/bin/rocm-smi` runs | install ROCm |
+
+Force decisions with `ENABLE=ipmi,smart` / `DISABLE=nvidia`. Re-run any time; it's
+idempotent. Check `journalctl -u telegraf -f` for plugin errors.
+
+**GPU passed through to a VM?** The host can't see it. Install Telegraf inside that VM with
+just `telegraf/host/telegraf.conf` + `optional/nvidia.conf` (same installer works in a VM).
+
+---
+
+## Day-2
+
+- **Update**: edit → commit → push. Portainer redeploys on poll/webhook. Dashboard JSON is
+  re-read by Grafana every 30 s, so dashboard edits don't even need a redeploy. Dashboards
+  edited in the UI: *Share → Export → JSON* → commit into `grafana/dashboards/`.
+- **Second host / cluster**: point additional PVE nodes' metric servers (and Telegraf) at
+  the same InfluxDB — every dashboard has a node/host selector. Or deploy the repo as a
+  second stack with a different env.
+- **Retention**: `INFLUXDB_RETENTION` (default 30d) only applies on first init; change it
+  later in the InfluxDB UI (*Load Data → Buckets*).
+- **Local test without Portainer**: `cp .env.example .env`, edit, `docker compose up -d`.
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| Stack fails: `INFLUXDB_ADMIN_PASSWORD` unset | env vars not pasted in Portainer |
+| Grafana: "datasource not found" / mounts empty | *relative path volumes* not enabled, or wrong local filesystem path |
+| Proxmox Overview empty | `pvesh get /cluster/metrics/server`; token/org/bucket match the stack env; port 8086 reachable from the PVE host |
+| Docker won't start in the LXC | `nesting=1` missing (*Options → Features*) |
+| Telegraf sends nothing | `systemctl status telegraf`, then `telegraf --config /etc/telegraf/telegraf.conf --config-directory /etc/telegraf/telegraf.d --test` |
+| GPU panel empty on old driver | `nvidia-smi -q -x \| head`; if it errors, the driver isn't loaded for that card |

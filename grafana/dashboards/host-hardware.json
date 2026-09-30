@@ -1,10 +1,10 @@
 {
   "uid": "pve-hardware",
-  "title": "R710 Hardware (IPMI / SMART / sensors)",
+  "title": "Host Hardware (IPMI / sensors / SMART / disks)",
   "tags": [
     "proxmox",
     "hardware",
-    "r710"
+    "host"
   ],
   "timezone": "browser",
   "editable": true,
@@ -20,7 +20,7 @@
     {
       "id": 22,
       "type": "row",
-      "title": "iDRAC / IPMI  (Telegraf ipmi_sensor on host: $host)",
+      "title": "BMC / IPMI sensors  (optional module: ipmi)  - host: $host",
       "collapsed": false,
       "gridPos": {
         "x": 0,
@@ -604,7 +604,7 @@
     {
       "id": 33,
       "type": "row",
-      "title": "CPU & kernel sensors (lm-sensors)",
+      "title": "CPU & board sensors  (optional module: sensors)",
       "collapsed": false,
       "gridPos": {
         "x": 0,
@@ -721,7 +721,7 @@
     {
       "id": 36,
       "type": "row",
-      "title": "Disks (SMART + I/O)",
+      "title": "Disks  (SMART = optional module; I/O always)",
       "collapsed": false,
       "gridPos": {
         "x": 0,
@@ -1025,7 +1025,7 @@
       "icon": "dashboard"
     },
     {
-      "title": "R710 Hardware",
+      "title": "Host Hardware",
       "type": "link",
       "url": "/d/pve-hardware",
       "icon": "dashboard"

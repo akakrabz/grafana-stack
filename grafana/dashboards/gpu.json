@@ -20,7 +20,7 @@
     {
       "id": 41,
       "type": "row",
-      "title": "GPU: $gpu  (Telegraf nvidia_smi on host)",
+      "title": "GPU: $gpu  (optional module: nvidia)",
       "collapsed": false,
       "gridPos": {
         "x": 0,
@@ -706,7 +706,7 @@
       "icon": "dashboard"
     },
     {
-      "title": "R710 Hardware",
+      "title": "Host Hardware",
       "type": "link",
       "url": "/d/pve-hardware",
       "icon": "dashboard"

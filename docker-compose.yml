@@ -61,7 +61,7 @@ services:
 
   # Optional: collects Docker/container metrics from the LXC itself
   # (the stack's own containers). Hardware/GPU metrics come from Telegraf
-  # installed directly on the PVE host - see telegraf/.
+  # installed directly on the PVE host - see telegraf/host/.
   telegraf:
     image: telegraf:1.32
     container_name: telegraf-stack
@@ -79,7 +79,7 @@ services:
       HOST_ETC: /hostfs/etc
       HOST_MOUNT_PREFIX: /hostfs
     volumes:
-      - ./telegraf/telegraf-stack.conf:/etc/telegraf/telegraf.conf:ro
+      - ./telegraf/stack/telegraf.conf:/etc/telegraf/telegraf.conf:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /:/hostfs:ro
     networks:
